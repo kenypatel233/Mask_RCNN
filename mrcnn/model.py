@@ -2174,7 +2174,7 @@ class MaskRCNN(object):
             anchors = np.broadcast_to(anchors, (config.BATCH_SIZE,) + anchors.shape)
             # A hack to get around Keras's bad support for constants
             # 원본 tf1 버전 코드
-            anchors = tf.keras.layers.Lambda(lambda x: tf.Variable(anchors), name="anchors")(input_image)
+            #anchors = tf.keras.layers.Lambda(lambda x: tf.Variable(anchors), name="anchors")(input_image)
            # anchors = AnchorsLayer(anchors, name="anchors")(input_image)
             """케라스에서 상수 레이어에 해당하는 레이어가 없어서 람다 레이어를 사용하는 편법이 있었는데
             이제 통하지 않는다!
@@ -2189,7 +2189,7 @@ class MaskRCNN(object):
                 def call(self, input):
                     return self.x
 
-            #anchors = ConstLayer(anchors, name="anchors")(input_image)
+            anchors = ConstLayer(anchors, name="anchors")(input_image)
         else:
             anchors = input_anchors
 
