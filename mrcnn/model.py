@@ -30,7 +30,7 @@ import keras.initializers as KI
 import keras.regularizers as KR
 import keras.constraints as KC
 from keras.utils import conv_utils
-from keras.engine import InputSpec 
+
 
 # Requires TensorFlow 2.0+
 from distutils.version import LooseVersion
