@@ -25,6 +25,13 @@ import tensorflow.keras.models as KM
 
 from mrcnn import utils
 
+# Mobilenet v1 imports
+import keras.initializers as KI
+import keras.regularizers as KR
+import keras.constraints as KC
+from keras.utils import conv_utils
+from keras.engine import InputSpec 
+
 # Requires TensorFlow 2.0+
 from distutils.version import LooseVersion
 assert LooseVersion(tf.__version__) >= LooseVersion("2.0")
@@ -78,8 +85,8 @@ def compute_backbone_shapes(config, image_shape):
     if callable(config.BACKBONE):
         return config.COMPUTE_BACKBONE_SHAPE(image_shape)
 
-    # Currently supports ResNet only
-    assert config.BACKBONE in ["resnet50", "resnet101"]
+    # Currently supports ResNet and mobilenetv1 only
+    assert config.BACKBONE in ["resnet50", "resnet101", "mobilenetv1"]
     return np.array(
         [[int(math.ceil(image_shape[0] / stride)),
             int(math.ceil(image_shape[1] / stride))]
@@ -204,6 +211,172 @@ def resnet_graph(input_image, architecture, stage5=False, train_bn=True):
         C5 = x = identity_block(x, 3, [512, 512, 2048], stage=5, block='c', train_bn=train_bn)
     else:
         C5 = None
+    return [C1, C2, C3, C4, C5]
+
+############################################################
+# Mobile Net V1 graph
+############################################################
+
+# Code adopted from:
+# https://github.com/fchollet/deep-learning-models/blob/master/mobilenet.py
+def relu6(x):
+    return K.relu(x, max_value=6)
+
+
+def _conv_block(inputs, filters, alpha, kernel=(3, 3), strides=(1, 1),block_id=1, train_bn=False):
+    """Adds an initial convolution layer (with batch normalization and relu6).
+    # Arguments
+        inputs: Input tensor of shape `(rows, cols, 3)`
+            (with `channels_last` data format) or
+            (3, rows, cols) (with `channels_first` data format).
+            It should have exactly 3 inputs channels,
+            and width and height should be no smaller than 32.
+            E.g. `(224, 224, 3)` would be one valid value.
+        filters: Integer, the dimensionality of the output space
+            (i.e. the number output of filters in the convolution).
+        alpha: controls the width of the network.
+            - If `alpha` < 1.0, proportionally decreases the number
+                of filters in each layer.
+            - If `alpha` > 1.0, proportionally increases the number
+                of filters in each layer.
+            - If `alpha` = 1, default number of filters from the paper
+                 are used at each layer.
+        kernel: An integer or tuple/list of 2 integers, specifying the
+            width and height of the 2D convolution window.
+            Can be a single integer to specify the same value for
+            all spatial dimensions.
+        strides: An integer or tuple/list of 2 integers,
+            specifying the strides of the convolution along the width and height.
+            Can be a single integer to specify the same value for
+            all spatial dimensions.
+            Specifying any stride value != 1 is incompatible with specifying
+            any `dilation_rate` value != 1.
+    # Input shape
+        4D tensor with shape:
+        `(samples, channels, rows, cols)` if data_format='channels_first'
+        or 4D tensor with shape:
+        `(samples, rows, cols, channels)` if data_format='channels_last'.
+    # Output shape
+        4D tensor with shape:
+        `(samples, filters, new_rows, new_cols)` if data_format='channels_first'
+        or 4D tensor with shape:
+        `(samples, new_rows, new_cols, filters)` if data_format='channels_last'.
+        `rows` and `cols` values might have changed due to stride.
+    # Returns
+        Output tensor of block.
+    """
+    channel_axis = 1 if K.image_data_format() == 'channels_first' else -1
+    filters = int(filters * alpha)
+    x = KL.Conv2D(filters, kernel,
+               padding='same',
+               use_bias=False,
+               strides=strides,
+               name='conv{}'.format(block_id))(inputs)
+    x = BatchNorm(axis=channel_axis, name='conv{}_bn'.format(block_id))(x, training = train_bn)
+    return KL.Activation(relu6, name='conv{}_relu'.format(block_id))(x)
+
+
+def _depthwise_conv_block(inputs, pointwise_conv_filters, alpha,
+                          depth_multiplier=1, strides=(1, 1), block_id=1, train_bn=False):
+    """Adds a depthwise convolution block.
+    A depthwise convolution block consists of a depthwise conv,
+    batch normalization, relu6, pointwise convolution,
+    batch normalization and relu6 activation.
+    # Arguments
+        inputs: Input tensor of shape `(rows, cols, channels)`
+            (with `channels_last` data format) or
+            (channels, rows, cols) (with `channels_first` data format).
+        pointwise_conv_filters: Integer, the dimensionality of the output space
+            (i.e. the number output of filters in the pointwise convolution).
+        alpha: controls the width of the network.
+            - If `alpha` < 1.0, proportionally decreases the number
+                of filters in each layer.
+            - If `alpha` > 1.0, proportionally increases the number
+                of filters in each layer.
+            - If `alpha` = 1, default number of filters from the paper
+                 are used at each layer.
+        depth_multiplier: The number of depthwise convolution output channels
+            for each input channel.
+            The total number of depthwise convolution output
+            channels will be equal to `filters_in * depth_multiplier`.
+        strides: An integer or tuple/list of 2 integers,
+            specifying the strides of the convolution along the width and height.
+            Can be a single integer to specify the same value for
+            all spatial dimensions.
+            Specifying any stride value != 1 is incompatible with specifying
+            any `dilation_rate` value != 1.
+        block_id: Integer, a unique identification designating the block number.
+    # Input shape
+        4D tensor with shape:
+        `(batch, channels, rows, cols)` if data_format='channels_first'
+        or 4D tensor with shape:
+        `(batch, rows, cols, channels)` if data_format='channels_last'.
+    # Output shape
+        4D tensor with shape:
+        `(batch, filters, new_rows, new_cols)` if data_format='channels_first'
+        or 4D tensor with shape:
+        `(batch, new_rows, new_cols, filters)` if data_format='channels_last'.
+        `rows` and `cols` values might have changed due to stride.
+    # Returns
+        Output tensor of block.
+    """
+    channel_axis = 1 if K.image_data_format() == 'channels_first' else -1
+    pointwise_conv_filters = int(pointwise_conv_filters * alpha)
+    # Depthwise
+    x = KL.DepthwiseConv2D((3, 3),
+                    padding='same',
+                    depth_multiplier=depth_multiplier,
+                    strides=strides,
+                    use_bias=False,
+                    name='conv_dw_{}'.format(block_id))(inputs)
+    x = BatchNorm(axis=channel_axis, name='conv_dw_{}_bn'.format(block_id))(x, training=train_bn)
+    x = KL.Activation(relu6, name='conv_dw_{}_relu'.format(block_id))(x)
+    # Pointwise
+    x = KL.Conv2D(pointwise_conv_filters, (1, 1),
+                    padding='same',
+                    use_bias=False,
+                    strides=(1, 1),
+                    name='conv_pw_{}'.format(block_id))(x)
+    x = BatchNorm(axis=channel_axis, name='conv_pw_{}_bn'.format(block_id))(x, training=train_bn)
+    return KL.Activation(relu6, name='conv_pw_{}_relu'.format(block_id))(x)
+
+
+def mobilenetv1_graph(inputs, architecture, alpha=1.0, depth_multiplier=1, train_bn = False):
+    """MobileNetv1
+    This function defines a MobileNetv1 architectures.
+    # Arguments
+        inputs: Inuput Tensor, e.g. an image
+        architecture: to preserve consistency
+        alpha: Width Multiplier
+        depth_multiplier: Resolution Multiplier
+        train_bn: Boolean. Train or freeze Batch Norm layres
+    # Returns
+        five MobileNetv1 model stages.
+    """
+    assert architecture in ["mobilenetv1"]
+    # Stage 1
+    x      = _conv_block(inputs, 32, alpha, strides=(2, 2), block_id=0, train_bn=train_bn)              #Input Resolution: 224 x 224
+    C1 = x = _depthwise_conv_block(x, 64, alpha, depth_multiplier, block_id=1, train_bn=train_bn)       #Input Resolution: 112 x 112
+
+    # Stage 2
+    x      = _depthwise_conv_block(x, 128, alpha, depth_multiplier, strides=(2, 2), block_id=2, train_bn=train_bn)
+    C2 = x = _depthwise_conv_block(x, 128, alpha, depth_multiplier, block_id=3, train_bn=train_bn)      #Input Resolution: 56 x 56
+
+    # Stage 3
+    x      = _depthwise_conv_block(x, 256, alpha, depth_multiplier, strides=(2, 2), block_id=4, train_bn=train_bn)
+    C3 = x = _depthwise_conv_block(x, 256, alpha, depth_multiplier, block_id=5, train_bn=train_bn)      #Input Resolution: 28 x 28
+
+    # Stage 4
+    x      = _depthwise_conv_block(x, 512, alpha, depth_multiplier, strides=(2, 2), block_id=6, train_bn=train_bn)
+    x      = _depthwise_conv_block(x, 512, alpha, depth_multiplier, block_id=7, train_bn=train_bn)
+    x      = _depthwise_conv_block(x, 512, alpha, depth_multiplier, block_id=8, train_bn=train_bn)
+    x      = _depthwise_conv_block(x, 512, alpha, depth_multiplier, block_id=9, train_bn=train_bn)
+    x      = _depthwise_conv_block(x, 512, alpha, depth_multiplier, block_id=10, train_bn=train_bn)
+    C4 = x = _depthwise_conv_block(x, 512, alpha, depth_multiplier, block_id=11, train_bn=train_bn)     #Input Resolution: 14 x 14
+
+    # Stage 5
+    x      = _depthwise_conv_block(x, 1024, alpha, depth_multiplier, strides=(2, 2), block_id=12, train_bn=train_bn)
+    C5 = x = _depthwise_conv_block(x, 1024, alpha, depth_multiplier, block_id=13, train_bn=train_bn)    #Input Resolution: 7x7
     return [C1, C2, C3, C4, C5]
 
 
@@ -983,9 +1156,38 @@ def fpn_classifier_graph(rois, feature_maps, image_meta,
 
     return mrcnn_class_logits, mrcnn_probs, mrcnn_bbox
 
+def _timedistributed_depthwise_conv_block(inputs, pointwise_conv_filters, strides=(1, 1), block_id=1, train_bn=False):
+    """Similiar to the _depthwise_conv_block used in the Backbone,
+    but with each layer wrapped in a TimeDistributed layer,
+    used to build the computation graph of the mask head of the FPN.
+    """
+    channel_axis = 1 if K.image_data_format() == 'channels_first' else -1
+
+    # Depthwise
+    x = KL.TimeDistributed(KL.DepthwiseConv2D(
+                    (3, 3),
+                    padding='same',
+                    depth_multiplier=1,
+                    strides=strides,
+                    use_bias=False),
+                    name='mrcnn_mask_conv_dw_{}'.format(block_id))(inputs)
+    x = KL.TimeDistributed(BatchNorm(axis=channel_axis),
+                    name='mrcnn_mask_conv_dw_{}_bn'.format(block_id))(x, training=train_bn)
+    x = KL.Activation(relu6, name='mrcnn_mask_conv_dw_{}_relu'.format(block_id))(x)
+    # Pointwise
+    x = KL.TimeDistributed(KL.Conv2D(pointwise_conv_filters,
+                    (1, 1),
+                    padding='same',
+                    use_bias=False,
+                    strides=(1, 1)),
+                    name='mrcnn_mask_conv_pw_{}'.format(block_id))(x)
+    x = KL.TimeDistributed(BatchNorm(
+                    axis=channel_axis),
+                    name='mrcnn_mask_conv_pw_{}_bn'.format(block_id))(x, training=train_bn)
+    return KL.Activation(relu6, name='mrcnn_mask_conv_pw_{}_relu'.format(block_id))(x)
 
 def build_fpn_mask_graph(rois, feature_maps, image_meta,
-                         pool_size, num_classes, train_bn=True):
+                         pool_size, num_classes, backbone, train_bn=True):
     """Builds the computation graph of the mask head of Feature Pyramid Network.
 
     rois: [batch, num_rois, (y1, x1, y2, x2)] Proposal boxes in normalized
@@ -998,12 +1200,14 @@ def build_fpn_mask_graph(rois, feature_maps, image_meta,
     train_bn: Boolean. Train or freeze Batch Norm layers
 
     Returns: Masks [batch, num_rois, MASK_POOL_SIZE, MASK_POOL_SIZE, NUM_CLASSES]
+
     """
+    assert backbone in ['resnet50','resnet101','mobilenetv1']
     # ROI Pooling
     # Shape: [batch, num_rois, MASK_POOL_SIZE, MASK_POOL_SIZE, channels]
     x = PyramidROIAlign([pool_size, pool_size],
                         name="roi_align_mask")([rois, image_meta] + feature_maps)
-
+    """
     # Conv layers
     x = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),
                            name="mrcnn_mask_conv1")(x)
@@ -1028,6 +1232,31 @@ def build_fpn_mask_graph(rois, feature_maps, image_meta,
     x = KL.TimeDistributed(BatchNorm(),
                            name='mrcnn_mask_bn4')(x, training=train_bn)
     x = KL.Activation('relu')(x)
+
+    x = KL.TimeDistributed(KL.Conv2DTranspose(256, (2, 2), strides=2, activation="relu"),
+                           name="mrcnn_mask_deconv")(x)
+    x = KL.TimeDistributed(KL.Conv2D(num_classes, (1, 1), strides=1, activation="sigmoid"),
+                           name="mrcnn_mask")(x)
+    return x
+    """
+    if backbone in ['resnet50','resnet101']:
+        x = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),name="mrcnn_mask_conv1")(x)
+        x = KL.TimeDistributed(BatchNorm(),name='mrcnn_mask_bn1')(x, training=train_bn)
+        x = KL.Activation('relu')(x)
+        x = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),name="mrcnn_mask_conv2")(x)
+        x = KL.TimeDistributed(BatchNorm(),name='mrcnn_mask_bn2')(x, training=train_bn)
+        x = KL.Activation('relu')(x)
+        x = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),name="mrcnn_mask_conv3")(x)
+        x = KL.TimeDistributed(BatchNorm(),name='mrcnn_mask_bn3')(x, training=train_bn)
+        x = KL.Activation('relu')(x)
+        x = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),name="mrcnn_mask_conv4")(x)
+        x = KL.TimeDistributed(BatchNorm(),name='mrcnn_mask_bn4')(x, training=train_bn)
+        x = KL.Activation('relu')(x)
+    if backbone in ['mobilenetv1','mobilenetv2']:
+        x = _timedistributed_depthwise_conv_block(x, 256, block_id = 1, train_bn = train_bn)
+        x = _timedistributed_depthwise_conv_block(x, 256, block_id = 2, train_bn = train_bn)
+        x = _timedistributed_depthwise_conv_block(x, 256, block_id = 3, train_bn = train_bn)
+        x = _timedistributed_depthwise_conv_block(x, 256, block_id = 4, train_bn = train_bn)
 
     x = KL.TimeDistributed(KL.Conv2DTranspose(256, (2, 2), strides=2, activation="relu"),
                            name="mrcnn_mask_deconv")(x)
@@ -1891,12 +2120,17 @@ class MaskRCNN(object):
         # Bottom-up Layers
         # Returns a list of the last layers of each stage, 5 in total.
         # Don't create the thead (stage 5), so we pick the 4th item in the list.
-        if callable(config.BACKBONE):
+        """if callable(config.BACKBONE):
             _, C2, C3, C4, C5 = config.BACKBONE(input_image, stage5=True,
                                                 train_bn=config.TRAIN_BN)
         else:
             _, C2, C3, C4, C5 = resnet_graph(input_image, config.BACKBONE,
-                                             stage5=True, train_bn=config.TRAIN_BN)
+                                             stage5=True, train_bn=config.TRAIN_BN)"""
+        if config.BACKBONE in ["resnet50", "resnet101"]:
+            _, C2, C3, C4, C5 = resnet_graph(input_image, config.BACKBONE, stage5=True, train_bn=config.TRAIN_BN)
+        elif config.BACKBONE in ["mobilenetv1"]:
+            _, C2, C3, C4, C5 = mobilenetv1_graph(input_image, config.BACKBONE, alpha=1.0, train_bn=config.TRAIN_BN)
+
         # Top-down Layers
         # TODO: add assert to varify feature map sizes match what's in config
         P5 = KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (1, 1), name='fpn_c5p5')(C5)
@@ -2141,19 +2375,46 @@ class MaskRCNN(object):
         # Update the log directory
         self.set_log_dir(filepath)
 
-    def get_imagenet_weights(self):
+    def get_imagenet_weights(self,no_top=True):
         """Downloads ImageNet trained weights from Keras.
         Returns path to weights file.
         """
+        assert self.config.BACKBONE in ["resnet50","mobilenetv1"]
+
         from keras.utils.data_utils import get_file
-        TF_WEIGHTS_PATH_NO_TOP = 'https://github.com/fchollet/deep-learning-models/'\
-                                 'releases/download/v0.2/'\
-                                 'resnet50_weights_tf_dim_ordering_tf_kernels_notop.h5'
-        weights_path = get_file('resnet50_weights_tf_dim_ordering_tf_kernels_notop.h5',
-                                TF_WEIGHTS_PATH_NO_TOP,
-                                cache_subdir='models',
-                                md5_hash='a268eb855778b3df3c7506639542a6af')
+        if no_top:
+            if self.config.BACKBONE == "resnet50":
+                TF_WEIGHTS_PATH_NO_TOP = 'https://github.com/fchollet/deep-learning-models/'\
+                                         'releases/download/v0.2/'\
+                                         'resnet50_weights_tf_dim_ordering_tf_kernels_notop.h5'
+                weights_path = get_file('resnet50_weights_tf_dim_ordering_tf_kernels_notop.h5',
+                                        TF_WEIGHTS_PATH_NO_TOP,
+                                        cache_subdir='models',
+                                        md5_hash='a268eb855778b3df3c7506639542a6af')
+            elif self.config.BACKBONE == "mobilenetv1":
+                TF_WEIGHTS_PATH_NO_TOP = 'https://github.com/fchollet/deep-learning-models/'\
+                                         'releases/download/v0.6/'\
+                                         'mobilenet_1_0_224_tf_no_top.h5'
+                weights_path = get_file('mobilenet_1_0_224_tf_no_top.h5',
+                                        TF_WEIGHTS_PATH_NO_TOP,
+                                        cache_subdir='models',
+                                        md5_hash='725ccbd03d61d7ced5b5c4cd17e7d527')
+        else:
+            if self.config.BACKBONE == "mobilenetv1":
+                TF_WEIGHTS_PATH  = 'https://github.com/fchollet/deep-learning-models/'\
+                                         'releases/download/v0.6/'\
+                                         'mobilenet_1_0_224_tf.h5'
+                weights_path = get_file('mobilenet_1_0_224_tf.h5',
+                                        TF_WEIGHTS_PATH,
+                                        cache_subdir='models',
+                                        md5_hash='03394917f9a9ea3362f46332a5b6a215')
         return weights_path
+
+
+
+
+        
+    
 
     def compile(self, learning_rate, momentum):
         """Gets the model ready for training. Adds losses, regularization, and
@@ -2316,13 +2577,22 @@ class MaskRCNN(object):
         layer_regex = {
             # all layers but the backbone
             "heads": r"(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
-            # From a specific Resnet stage and up
-            "3+": r"(res3.*)|(bn3.*)|(res4.*)|(bn4.*)|(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
-            "4+": r"(res4.*)|(bn4.*)|(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
-            "5+": r"(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
             # All layers
             "all": ".*",
         }
+        if self.config.BACKBONE in ["resnet50", "resnet101"]:
+            # From a specific Resnet stage and up
+            stage_regex = { "3+": r"(res3.*)|(bn3.*)|(res4.*)|(bn4.*)|(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
+                            "4+": r"(res4.*)|(bn4.*)|(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
+                            "5+": r"(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)" }
+        elif self.config.BACKBONE in ["mobilenetv1"]:
+            # From a specific Mobilenetv1 stage and up
+            stage_regex = { "3+": r"(conv.*5.*)|(conv.*6.*)|(conv.*7.*)|(conv.*8.*)|(conv.*9.*)|(conv.*10.*)|(conv.*11.*)|(conv.*12.*)|(conv.*13.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
+                            "4+": r"(conv.*11.*)|(conv.*12.*)|(conv.*13.*)|(bn4.*)|(mob5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
+                            "5+": r"(conv.*13.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)" }
+        
+
+        layer_regex.update(stage_regex)
         if layers in layer_regex.keys():
             layers = layer_regex[layers]
 
@@ -2800,12 +3070,19 @@ def mold_image(images, config):
     the mean pixel and converts it to float. Expects image
     colors in RGB order.
     """
-    return images.astype(np.float32) - config.MEAN_PIXEL
+    if config.BACKBONE in ["mobilenetv1"]:
+        return images.astype(np.float32)/127.5 - 1.0
+    if config.BACKBONE in ["resnet50","resnet101"]:
+        images.astype(np.float32) - config.MEAN_PIXEL
+    
 
 
 def unmold_image(normalized_images, config):
     """Takes a image normalized with mold() and returns the original."""
-    return (normalized_images + config.MEAN_PIXEL).astype(np.uint8)
+    if config.BACKBONE in ["mobilenetv1"]:
+        return ((normalized_images +1)*127.5).astype(np.uint8)
+    if config.BACKBONE in ["resnet50","resnet101"]:
+        return (normalized_images + config.MEAN_PIXEL).astype(np.uint8)
 
 
 ############################################################
