@@ -41,7 +41,17 @@ tf.compat.v1.disable_eager_execution()
 ############################################################
 #  Utility Functions
 ############################################################
+class AnchorsLayer(KL.Layer):
+    def __init__(self, anchors, name="anchors", **kwargs):
+        super(AnchorsLayer, self).__init__(name=name, **kwargs)
+        self.anchors = tf.Variable(anchors)
 
+    def call(self, dummy):
+        return self.anchors
+
+    def get_config(self):
+        config = super(AnchorsLayer, self).get_config()
+        return config
 
 def log(text, array=None):
     """Prints a text message. And, optionally, if a Numpy array is provided it
@@ -2165,6 +2175,7 @@ class MaskRCNN(object):
             # A hack to get around Keras's bad support for constants
             # 원본 tf1 버전 코드
             # anchors = tf.keras.layers.Lambda(lambda x: tf.Variable(anchors), name="anchors")(input_image)
+            anchors = AnchorsLayer(anchors, name="anchors")(input_image)
             """케라스에서 상수 레이어에 해당하는 레이어가 없어서 람다 레이어를 사용하는 편법이 있었는데
             이제 통하지 않는다!
             그건 그렇고 인풋 함수가 있는데 왜 저렇게 짠거지??? 아무튼 커스텀 레이어 작성해서 상수 텐서를 리턴해주기로 함.
